@@ -73,6 +73,7 @@ esp_err_t pkt_eth2wifi(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t le
     if (memcmp(eth_mac, s_broadcast_address, 6) == 0) { // fixme: support multicasts, too
         // this packet should go to both. internal TCPIP stack and WiFi
         uint8_t *new_buf = malloc(len);
+        memcpy(new_buf, buffer, len);
         esp_netif_receive((esp_netif_t *)priv, new_buf, len, NULL);
     }
 
