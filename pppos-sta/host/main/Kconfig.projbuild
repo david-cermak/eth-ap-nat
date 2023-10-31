@@ -1,0 +1,70 @@
+menu "Example Configuration"
+
+    config BROKER_URL
+        string "Broker URL"
+        default "mqtt://mqtt.eclipseprojects.io"
+        help
+            URL of the broker to connect to
+
+    config BROKER_URL_FROM_STDIN
+        bool
+        default y if BROKER_URL = "FROM_STDIN"
+
+    choice EXAMPLE_CONNECT_PPP_DEVICE
+        prompt "Choose PPP device"
+        default EXAMPLE_CONNECT_PPP_DEVICE_UART
+        help
+            Select which peripheral to use to connect to the PPP server.
+
+        config EXAMPLE_CONNECT_PPP_DEVICE_USB
+            bool "USB"
+            depends on SOC_USB_OTG_SUPPORTED
+            select TINYUSB_CDC_ENABLED
+            help
+                Use USB ACM device.
+
+        config EXAMPLE_CONNECT_PPP_DEVICE_UART
+            bool "UART"
+            help
+                Use UART.
+
+        config EXAMPLE_CONNECT_PPP_DEVICE_SPI
+            bool "SPI"
+            help
+                Use SPI HD.
+
+    endchoice
+
+    menu "UART Configuration"
+        depends on EXAMPLE_CONNECT_PPP_DEVICE_UART
+        config EXAMPLE_CONNECT_UART_TX_PIN
+            int "TXD Pin Number"
+            default 4
+            range 0 31
+            help
+                Pin number of UART TX.
+
+        config EXAMPLE_CONNECT_UART_RX_PIN
+            int "RXD Pin Number"
+            default 5
+            range 0 31
+            help
+                Pin number of UART RX.
+
+        config EXAMPLE_CONNECT_UART_BAUDRATE
+            int "UART Baudrate"
+            default 115200
+            range 9600 3000000
+            help
+                Baudrate of the UART device
+
+    endmenu
+
+    config EXAMPLE_PPP_CONN_MAX_RETRY
+        int "Maximum retry"
+        default 6
+        help
+            Set the Maximum retry to avoid station reconnecting if the pppd
+            is not available
+
+endmenu
