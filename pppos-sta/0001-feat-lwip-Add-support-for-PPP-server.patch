@@ -1,0 +1,108 @@
+From 38ee2291114aa8ca4b7da63e44ae0afdd3921c75 Mon Sep 17 00:00:00 2001
+From: David Cermak <cermak@espressif.com>
+Date: Wed, 4 Oct 2023 17:35:57 +0200
+Subject: [PATCH] feat(lwip): Add support for PPP server
+
+---
+ components/esp_netif/include/esp_netif_ppp.h   |  2 ++
+ components/esp_netif/lwip/esp_netif_lwip.c     |  2 +-
+ components/esp_netif/lwip/esp_netif_lwip_ppp.c | 14 ++++++++++++++
+ components/lwip/Kconfig                        |  7 +++++++
+ components/lwip/port/include/lwipopts.h        |  4 ++++
+ 5 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/components/esp_netif/include/esp_netif_ppp.h b/components/esp_netif/include/esp_netif_ppp.h
+index c9856c6206..50690af462 100644
+--- a/components/esp_netif/include/esp_netif_ppp.h
++++ b/components/esp_netif/include/esp_netif_ppp.h
+@@ -28,6 +28,8 @@ typedef struct esp_netif_ppp_config {
+                                      *   The current session must be closed, settings will be applied upon connecting.
+                                      *   */
+ #endif // CONFIG_LWIP_ENABLE_LCP_ECHO
++    uint32_t ppp_our_ip4_addr;   /**< Set our preferred address, typically used when we're the PPP server */
++    uint32_t ppp_their_ip4_addr; /**< Set our preferred address, typically used when we're the PPP server */
+ } esp_netif_ppp_config_t;
+ 
+ /** @brief event id offset for PHASE related events
+diff --git a/components/esp_netif/lwip/esp_netif_lwip.c b/components/esp_netif/lwip/esp_netif_lwip.c
+index 69fdaf6d1f..ebaa14931b 100644
+--- a/components/esp_netif/lwip/esp_netif_lwip.c
++++ b/components/esp_netif/lwip/esp_netif_lwip.c
+@@ -510,7 +510,7 @@ esp_netif_t* esp_netif_get_handle_from_netif_impl(void *dev)
+ void* esp_netif_get_netif_impl(esp_netif_t *esp_netif)
+ {
+     // get impl ptr only for vanilla lwip impl (ppp_pcb not supported)
+-    if (esp_netif && !ESP_NETIF_IS_POINT2POINT_TYPE(esp_netif, PPP_LWIP_NETIF)) {
++    if (esp_netif) { //} && !ESP_NETIF_IS_POINT2POINT_TYPE(esp_netif, PPP_LWIP_NETIF)) {
+         return esp_netif->lwip_netif;
+     }
+     return NULL;
+diff --git a/components/esp_netif/lwip/esp_netif_lwip_ppp.c b/components/esp_netif/lwip/esp_netif_lwip_ppp.c
+index 5233dd31a5..5fc8d43af6 100644
+--- a/components/esp_netif/lwip/esp_netif_lwip_ppp.c
++++ b/components/esp_netif/lwip/esp_netif_lwip_ppp.c
+@@ -272,7 +272,11 @@ esp_err_t esp_netif_start_ppp(esp_netif_t *esp_netif)
+ #endif
+ 
+     ESP_LOGD(TAG, "%s: Starting PPP connection: %p", __func__, ppp_ctx->ppp);
++#ifdef CONFIG_LWIP_PPP_SERVER_SUPPORT
++    esp_err_t err = pppapi_listen(ppp_ctx->ppp);
++#else
+     esp_err_t err = pppapi_connect(ppp_ctx->ppp, 0);
++#endif
+     if (err != ESP_OK) {
+         ESP_LOGE(TAG, "%s: PPP connection cannot be started", __func__);
+         if (ppp_ctx->ppp_error_event_enabled) {
+@@ -328,6 +332,16 @@ esp_err_t esp_netif_ppp_set_params(esp_netif_t *netif, const esp_netif_ppp_confi
+ #ifdef CONFIG_LWIP_ENABLE_LCP_ECHO
+     obj->ppp_lcp_echo_disabled = config->ppp_lcp_echo_disabled;
+ #endif
++    if (config->ppp_our_ip4_addr != 0) {
++        // Set our preferred address, and accept the remote
++        obj->ppp->ipcp_wantoptions.ouraddr = config->ppp_our_ip4_addr;
++        obj->ppp->ipcp_wantoptions.accept_remote = 1;
++    }
++    if (config->ppp_their_ip4_addr != 0) {
++        // Set their preferred address, and accept the local
++        obj->ppp->ipcp_wantoptions.hisaddr = config->ppp_their_ip4_addr;
++        obj->ppp->ipcp_wantoptions.accept_local = 1;
++    }
+     return ESP_OK;
+ }
+ 
+diff --git a/components/lwip/Kconfig b/components/lwip/Kconfig
+index cb8f86bd4b..310d098f6b 100644
+--- a/components/lwip/Kconfig
++++ b/components/lwip/Kconfig
+@@ -810,6 +810,13 @@ menu "LWIP"
+         help
+             Enable PPP stack. Now only PPP over serial is possible.
+ 
++    config LWIP_PPP_SERVER_SUPPORT
++        bool "Enable PPP server support"
++        depends on LWIP_PPP_SUPPORT
++        default n
++        help
++            Enable to use PPP server.
++
+     config LWIP_PPP_ENABLE_IPV6
+         bool "Enable IPV6 support for PPP connections (IPV6CP)"
+         depends on LWIP_PPP_SUPPORT && LWIP_IPV6
+diff --git a/components/lwip/port/include/lwipopts.h b/components/lwip/port/include/lwipopts.h
+index 183b7be80a..8a6ffd6776 100644
+--- a/components/lwip/port/include/lwipopts.h
++++ b/components/lwip/port/include/lwipopts.h
+@@ -1023,6 +1023,10 @@ static inline uint32_t timeout_from_offered(uint32_t lease, uint32_t min)
+ #ifdef CONFIG_LWIP_PPP_SUPPORT
+ #define PPP_SUPPORT                     1
+ 
++#ifdef CONFIG_LWIP_PPP_SERVER_SUPPORT
++#define PPP_SERVER                      1
++#endif
++
+ /**
+  * PPP_IPV6_SUPPORT == 1: Enable IPV6 support for local link
+  * between modem and lwIP stack.
+-- 
+2.25.1
+
