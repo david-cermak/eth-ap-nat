@@ -111,6 +111,7 @@ static void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = CONFIG_BROKER_URL,
+//        .broker.address.uri = "mqtt://10.42.0.1",
     };
 #if CONFIG_BROKER_URL_FROM_STDIN
     char line[128];
@@ -144,6 +145,47 @@ static void mqtt_app_start(void)
 }
 
 esp_err_t example_ppp_connect(void);
+#include "ping/ping_sock.h"
+
+static void test_on_ping_success(esp_ping_handle_t hdl, void *args)
+{
+    uint8_t ttl;
+    uint16_t seqno;
+    uint32_t elapsed_time, recv_len;
+    ip_addr_t target_addr;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO, &seqno, sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TTL, &ttl, sizeof(ttl));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR, &target_addr, sizeof(target_addr));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SIZE, &recv_len, sizeof(recv_len));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed_time, sizeof(elapsed_time));
+    printf("%" PRId32 "bytes from %s icmp_seq=%d ttl=%d time=%" PRId32 " ms\n",
+           recv_len, inet_ntoa(target_addr.u_addr.ip4), seqno, ttl, elapsed_time);
+}
+
+static void test_on_ping_timeout(esp_ping_handle_t hdl, void *args)
+{
+    uint16_t seqno;
+    ip_addr_t target_addr;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_SEQNO, &seqno, sizeof(seqno));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_IPADDR, &target_addr, sizeof(target_addr));
+    printf("From %s icmp_seq=%d timeout\n", inet_ntoa(target_addr.u_addr.ip4), seqno);
+}
+
+static void test_on_ping_end(esp_ping_handle_t hdl, void *args)
+{
+    uint32_t transmitted;
+    uint32_t received;
+    uint32_t total_time_ms;
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST, &transmitted, sizeof(transmitted));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &received, sizeof(received));
+    esp_ping_get_profile(hdl, ESP_PING_PROF_DURATION, &total_time_ms, sizeof(total_time_ms));
+    printf("%" PRId32 " packets transmitted, %" PRId32 " received, time %" PRId32 "ms\n", transmitted, received, total_time_ms);
+
+}
+
+#include "esp_log.h"
+#include "esp_console.h"
+void register_iperf(void);
 
 void app_main(void)
 {
@@ -171,7 +213,102 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to connect");
         return ;
     }
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    repl_config.prompt = "iperf>";
+    // init console REPL environment
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
 
-    mqtt_app_start();
+    /* Register commands */
+//    return;
+    register_iperf();
+
+    printf("\n =======================================================\n");
+    printf(" |       Steps to Test PPP Client Bandwidth            |\n");
+    printf(" |                                                     |\n");
+    printf(" |  1. Enter 'help', check all supported commands      |\n");
+    printf(" |  2. Start PPP server on host system                 |\n");
+    printf(" |     - pppd /dev/ttyUSB1 115200 192.168.11.1:192.168.11.2 modem local noauth debug nocrtscts nodetach +ipv6\n");
+    printf(" |  3. Wait ESP32 to get IP from PPP server            |\n");
+    printf(" |  4. Enter 'pppd info' (optional)                    |\n");
+    printf(" |  5. Server: 'iperf -u -s -i 3'                      |\n");
+    printf(" |  6. Client: 'iperf -u -c SERVER_IP -t 60 -i 3'      |\n");
+    printf(" |                                                     |\n");
+    printf(" =======================================================\n\n");
+
+    // start console REPL
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
+#if 0
+    ip_addr_t target_addr = { .type = IPADDR_TYPE_V4, .u_addr.ip4.addr = 0x08080808 };
+
+    esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+    ping_config.timeout_ms = 2000;
+    ping_config.interval_ms = 20,
+    ping_config.target_addr = target_addr;
+    ping_config.count = 100; // ping in infinite mode
+    /* set callback functions */
+    esp_ping_callbacks_t cbs;
+    cbs.on_ping_success = test_on_ping_success;
+    cbs.on_ping_timeout = test_on_ping_timeout;
+    cbs.on_ping_end = test_on_ping_end;
+    esp_ping_handle_t ping;
+    esp_ping_new_session(&ping_config, &cbs, &ping);
+    /* start ping */
+    esp_ping_start(ping);
+#endif
+
+//    mqtt_app_start();
+    return;
+    char rx_buffer[128];
+    static const char *payload = "Message from ESP32 ";
+
+    struct sockaddr_in dest_addr;
+//    char host_ip[] = "10.42.0.1";
+    char host_ip[] = "192.168.0.18";
+    inet_pton(AF_INET, host_ip, &dest_addr.sin_addr);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(3333);
+    int sock =  socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        return;
+    }
+    ESP_LOGI(TAG, "Socket created, connecting to %s:%d", host_ip, 3333);
+
+    int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err != 0) {
+        ESP_LOGE(TAG, "Socket unable to connect: errno %d", errno);
+        return;
+    }
+    ESP_LOGI(TAG, "Successfully connected");
+
+    while (1) {
+        int err = send(sock, payload, strlen(payload), 0);
+        if (err < 0) {
+            ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+            break;
+        }
+
+        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+        // Error occurred during receiving
+        if (len < 0) {
+            ESP_LOGE(TAG, "recv failed: errno %d", errno);
+            break;
+        }
+            // Data received
+        else {
+            rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string
+            ESP_LOGI(TAG, "Received %d bytes from %s:", len, host_ip);
+            ESP_LOGI(TAG, "%s", rx_buffer);
+        }
+    }
+
+    if (sock != -1) {
+        ESP_LOGE(TAG, "Shutting down socket and restarting...");
+        shutdown(sock, 0);
+        close(sock);
+    }
 
 }

@@ -40,7 +40,7 @@
 #define TX_SIZE_MIN  40
 
 static     spi_device_handle_t spi;
-static uint8_t s_tx_frames = -1;
+static uint8_t s_tx_frames = 0;
 static uint8_t s_rx_frames = 0;
 
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_USB
@@ -50,7 +50,7 @@ static uint8_t s_rx_frames = 0;
 static int s_itf;
 static uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
 
-#elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_USB
+#elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_UART
 
 #include "driver/uart.h"
 #define BUF_SIZE (1024)
@@ -82,12 +82,15 @@ static const int GOT_IPV6 = BIT2;
 
 static esp_err_t transmit(void *h, void *buffer, size_t len)
 {
-    ESP_LOG_BUFFER_HEXDUMP(TAG, buffer, len, ESP_LOG_VERBOSE);
+//    printf("O%d|\n", len);
+//    ESP_LOG_BUFFER_HEXDUMP(TAG, buffer, len, ESP_LOG_ERROR);
+//    ESP_LOGE(TAG, "len=%d\n", len);
+
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
     struct wifi_buf buf = { .buffer = malloc(len), .len = len};
     memcpy(buf.buffer, buffer, len);
 
-    BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(100));
+    BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(10));
     if (ret != pdTRUE) {
         ESP_LOGE(TAG, "Failed to queue packet to slave!");
     }
@@ -171,10 +174,15 @@ static void line_state_changed(int itf, cdcacm_event_t *event)
     ESP_LOGI(TAG, "Line state changed on channel %d", itf);
 }
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_UART
+//#define BUF_SIZE (1024)
+#define UART_TX_PIN 11
+#define UART_RX_PIN 10
 static void ppp_task(void *args)
 {
     uart_config_t uart_config = {};
-    uart_config.baud_rate = CONFIG_EXAMPLE_CONNECT_UART_BAUDRATE;
+//    uart_config.baud_rate = CONFIG_EXAMPLE_CONNECT_UART_BAUDRATE;
+//    uart_config.baud_rate = 921600;
+    uart_config.baud_rate = 3000000;
     uart_config.data_bits = UART_DATA_8_BITS;
     uart_config.parity    = UART_PARITY_DISABLE;
     uart_config.stop_bits = UART_STOP_BITS_1;
@@ -184,7 +192,8 @@ static void ppp_task(void *args)
     QueueHandle_t event_queue;
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, BUF_SIZE, 0, 16, &event_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, CONFIG_EXAMPLE_CONNECT_UART_TX_PIN, CONFIG_EXAMPLE_CONNECT_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+//    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, CONFIG_EXAMPLE_CONNECT_UART_TX_PIN, CONFIG_EXAMPLE_CONNECT_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_set_rx_timeout(UART_NUM_1, 1));
 
     char *buffer = (char*)malloc(BUF_SIZE);
@@ -206,6 +215,8 @@ static void ppp_task(void *args)
             if (len) {
                 len = uart_read_bytes(UART_NUM_1, buffer, BUF_SIZE, 0);
                 ESP_LOG_BUFFER_HEXDUMP(TAG, buffer, len, ESP_LOG_VERBOSE);
+//                ESP_LOGW(TAG, "len=%d\n", len);
+
                 esp_netif_receive(s_netif, buffer, len, NULL);
             }
         } else {
@@ -234,7 +245,7 @@ static void init_master_hd(spi_device_handle_t* out_spi)
 
     //add device
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.clock_speed_hz = 10*1000*1000;
+    dev_cfg.clock_speed_hz = 40*1000*1000;
     dev_cfg.mode = 0;
     dev_cfg.spics_io_num = GPIO_CS;
     dev_cfg.cs_ena_pretrans = 0;
@@ -312,23 +323,27 @@ static void ppp_task(void *args)
 
         ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, &temp, SLAVE_TX_READY_FLAG_REG, 1, 0));
         if (s_tx_frames != temp) {
-            ESP_LOGD(TAG, "Slave has something %d %d", temp, s_tx_frames);
+//            printf("|%d|", temp);
+//            ESP_LOGW(TAG, "Slave has something %d %d", temp, s_tx_frames);
             uint32_t size_to_read = 0;
-            s_tx_frames++;
             size_to_read = get_slave_tx_buf_size(spi);
             if (size_to_read > 0) {
+                s_tx_frames++;
                 ESP_ERROR_CHECK(essl_spi_rddma(spi, recv_buf, size_to_read, -1, 0));
-                ESP_LOGD(TAG, "RECEIVING......len=%d", (int)size_to_read);
+//                ESP_LOG_BUFFER_HEXDUMP(TAG, recv_buf, size_to_read, ESP_LOG_WARN);
+//                ESP_LOGE(TAG, "RECEIVING......len=%d", (int)size_to_read);
+//                printf("I%d|\n", (int)size_to_read);
                 esp_netif_receive(s_netif, recv_buf, size_to_read, NULL);
             }
 
         } else {
-            ESP_LOGD(TAG, "Slave doesn't have anything to say %d %d", temp, s_tx_frames);
+            printf(".");
+//            ESP_LOGW(TAG, "Slave doesn't have anything to say %d %d", temp, s_tx_frames);
 
         }
 
         struct wifi_buf buf;
-        BaseType_t ret = xQueueReceive(s_tx_queue, &buf, pdMS_TO_TICKS(200));
+        BaseType_t ret = xQueueReceive(s_tx_queue, &buf, pdMS_TO_TICKS(10));
         if (ret == pdTRUE) {
 
             ESP_LOGD(TAG, "Got packet ready to send... sending!");
@@ -337,12 +352,14 @@ static void ppp_task(void *args)
                 if (s_rx_frames != temp) {
                     break;
                 }
-                ESP_LOGD(TAG, "Slave NOT ready  ... %d %d", temp, s_rx_frames);
-                vTaskDelay(pdMS_TO_TICKS(500));
+//                ESP_LOGI(TAG, "Slave NOT ready  ... %d %d", temp, s_rx_frames);
+                printf("X");
+//                vTaskDelay(pdMS_TO_TICKS(10));
             }
             s_rx_frames++;
             ESP_LOGD(TAG, "Slave is ready %d %d!!", temp, s_rx_frames);
             ESP_ERROR_CHECK(essl_spi_wrdma(spi, buf.buffer, buf.len, -1, 0));
+            free(buf.buffer);
 
         }
     }
@@ -406,21 +423,26 @@ esp_err_t example_ppp_connect(void)
 
     esp_netif_action_start(s_netif, 0, 0, 0);
     esp_netif_action_connected(s_netif, 0, 0, 0);
+    if (xTaskCreate(ppp_task, "ppp connect", 4096, NULL, 18, NULL) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create a ppp connection task");
+        return ESP_FAIL;
+    }
+
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_USB
     esp_netif_action_start(s_netif, 0, 0, 0);
     esp_netif_action_connected(s_netif, 0, 0, 0);
 #else // DEVICE is UART
     s_stop_task = false;
-    if (xTaskCreate(ppp_task, "ppp connect", 4096, NULL, 5, NULL) != pdTRUE) {
+    if (xTaskCreate(ppp_task, "ppp connect", 4096, NULL, 18, NULL) != pdTRUE) {
         ESP_LOGE(TAG, "Failed to create a ppp connection task");
         return ESP_FAIL;
     }
 #endif // CONNECT_PPP_DEVICE
 
-    if (xTaskCreate(ppp_task, "ppp connect", 4096, NULL, 5, NULL) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to create a ppp connection task");
-        return ESP_FAIL;
-    }
+//    if (xTaskCreate(ppp_task, "ppp connect", 4096, NULL, 5, NULL) != pdTRUE) {
+//        ESP_LOGE(TAG, "Failed to create a ppp connection task");
+//        return ESP_FAIL;
+//    }
     ESP_LOGI(TAG, "Waiting for IP address");
     EventBits_t bits = xEventGroupWaitBits(s_event_group, CONNECT_BITS, pdFALSE, pdFALSE, portMAX_DELAY);
     if (bits & CONNECTION_FAILED) {
