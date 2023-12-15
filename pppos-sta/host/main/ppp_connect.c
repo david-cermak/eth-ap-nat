@@ -30,12 +30,12 @@
 
 //----------------------Updating Info------------------------//
 //Value in these 4 registers indicates size of the TX buffer that Slave has loaded to the DMA
-#define SLAVE_TX_READY_BUF_SIZE_REG     12
-//Value in these 4 registers indicates number of the RX buffer that Slave has loaded to the DMA
-#define SLAVE_RX_READY_BUF_NUM_REG      16
-
-#define SLAVE_RX_READY_FLAG_REG      20
-#define SLAVE_TX_READY_FLAG_REG      21
+//#define SLAVE_TX_READY_BUF_SIZE_REG     12
+////Value in these 4 registers indicates number of the RX buffer that Slave has loaded to the DMA
+//#define SLAVE_RX_READY_BUF_NUM_REG      16
+//
+//#define SLAVE_RX_READY_FLAG_REG      20
+//#define SLAVE_TX_READY_FLAG_REG      21
 
 #define TX_SIZE_MIN  40
 
@@ -228,6 +228,35 @@ static void ppp_task(void *args)
 }
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
 
+struct spihd_regs {
+    uint16_t tx_size;
+    uint8_t magic;
+    uint8_t tx_count;
+    uint8_t rx_count;
+    uint8_t checksum;
+} __attribute__((packed));
+
+static struct spihd_regs s_regs = {  };
+
+static bool get_regs(void)
+{
+    esp_err_t ret = essl_spi_rdbuf(spi, (uint8_t *)&s_regs, 0,  sizeof(s_regs), 0);
+    if (ret != ESP_OK) {
+        return false;
+    }
+    uint8_t checksum_orig = s_regs.checksum;
+    uint8_t checksum = 0;
+    s_regs.checksum = 0;
+    for (int i=0; i< sizeof(s_regs); ++i)
+        checksum += ((uint8_t*)&s_regs)[i];
+    if (checksum != checksum_orig) {
+        ESP_LOGE(TAG, "Wrong checksum!");
+        return false;
+    }
+    return true;
+}
+
+
 static void init_master_hd(spi_device_handle_t* out_spi)
 {
     //init bus
@@ -262,30 +291,21 @@ static void init_master_hd(spi_device_handle_t* out_spi)
     ESP_ERROR_CHECK(spi_bus_add_device(MASTER_HOST, &dev_cfg, out_spi));
 
     s_tx_queue = xQueueCreate(16, sizeof(struct wifi_buf));
-    esp_err_t ret;
-    uint32_t slave_ready_flag;
 
     while (1) {
-        //Master sends CMD2 to get slave configuration
-        //The first byte is a flag assigned by slave as a start signal, here it's 0xee
-        ret = essl_spi_rdbuf(spi, (uint8_t *)&slave_ready_flag, SLAVE_READY_FLAG_REG, 4, 0);
-        if (ret != ESP_OK) {
-            abort();
+        if (!get_regs()) {
+            printf("x");
         }
-
-        if (slave_ready_flag != SLAVE_READY_FLAG) {
-            printf("Waiting for Slave to be ready...\n");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-        } else if (slave_ready_flag == SLAVE_READY_FLAG) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        if (s_regs.magic == 0)
             break;
-        }
     }
 
-    uint32_t slave_max_buf_size;
-    ESP_ERROR_CHECK(essl_spi_rdbuf(spi, (uint8_t *)&slave_max_buf_size, SLAVE_MAX_TX_BUF_LEN_REG, 4, 0));
-    printf("Slave MAX TX Buffer Size:       %"PRIu32"\n", slave_max_buf_size);
-    ESP_ERROR_CHECK(essl_spi_rdbuf(spi, (uint8_t *)&slave_max_buf_size, SLAVE_MAX_RX_BUF_LEN_REG, 4, 0));
-    printf("Slave MAX Rx Buffer Size:       %"PRIu32"\n", slave_max_buf_size);
+    uint32_t slave_max_buf_size = 1600;
+//    ESP_ERROR_CHECK(essl_spi_rdbuf(spi, (uint8_t *)&slave_max_buf_size, SLAVE_MAX_TX_BUF_LEN_REG, 4, 0));
+//    printf("Slave MAX TX Buffer Size:       %"PRIu32"\n", slave_max_buf_size);
+//    ESP_ERROR_CHECK(essl_spi_rdbuf(spi, (uint8_t *)&slave_max_buf_size, SLAVE_MAX_RX_BUF_LEN_REG, 4, 0));
+//    printf("Slave MAX Rx Buffer Size:       %"PRIu32"\n", slave_max_buf_size);
     uint8_t *send_buf = heap_caps_calloc(1, slave_max_buf_size, MALLOC_CAP_DMA);
     if (!send_buf) {
         ESP_LOGE(TAG, "No enough memory!");
@@ -294,73 +314,50 @@ static void init_master_hd(spi_device_handle_t* out_spi)
 
 }
 
-static uint32_t get_slave_tx_buf_size(spi_device_handle_t spi)
-{
-    uint32_t updated_size;
-    uint32_t temp;
-    ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, (uint8_t *)&temp, SLAVE_TX_READY_BUF_SIZE_REG, 4, 0));
-    /**
-     * Read until the last 2 reading result are same. Reason:
-     * SPI transaction is carried on per 1 Byte. So when Master is reading the shared register, if the
-     * value is changed by Slave at this time, Master may get wrong data.
-     */
-    while (1) {
-        ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, (uint8_t *)&updated_size, SLAVE_TX_READY_BUF_SIZE_REG, 4, 0));
-        if (updated_size == temp) {
-            return updated_size;
-        }
-        temp = updated_size;
-    }
-}
-
-
 static void ppp_task(void *args)
 {
     uint8_t *recv_buf = heap_caps_calloc(1, 1600, MALLOC_CAP_DMA);
 
+    BaseType_t tx_queue_stat = pdFALSE;
+    struct wifi_buf buf;
     while (1) {
-        uint8_t temp;
 
-        ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, &temp, SLAVE_TX_READY_FLAG_REG, 1, 0));
-        if (s_tx_frames != temp) {
+        while (!get_regs() || s_regs.magic != 0x5A)
+        {
+            ESP_LOGW(TAG, "failed to get regs!");
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+//        ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, &temp, SLAVE_TX_READY_FLAG_REG, 1, 0));
+        if (s_tx_frames != s_regs.tx_count) {
 //            printf("|%d|", temp);
 //            ESP_LOGW(TAG, "Slave has something %d %d", temp, s_tx_frames);
-            uint32_t size_to_read = 0;
-            size_to_read = get_slave_tx_buf_size(spi);
-            if (size_to_read > 0) {
+//            uint32_t size_to_read = 0;
+//            size_to_read = get_slave_tx_buf_size(spi);
+//            if (size_to_read > 0) {
                 s_tx_frames++;
-                ESP_ERROR_CHECK(essl_spi_rddma(spi, recv_buf, size_to_read, -1, 0));
+                ESP_ERROR_CHECK(essl_spi_rddma(spi, recv_buf, s_regs.tx_size, -1, 0));
 //                ESP_LOG_BUFFER_HEXDUMP(TAG, recv_buf, size_to_read, ESP_LOG_WARN);
 //                ESP_LOGE(TAG, "RECEIVING......len=%d", (int)size_to_read);
 //                printf("I%d|\n", (int)size_to_read);
-                esp_netif_receive(s_netif, recv_buf, size_to_read, NULL);
-            }
+                esp_netif_receive(s_netif, recv_buf, s_regs.tx_size, NULL);
+//            }
 
         } else {
-            printf(".");
+//            printf(".");
 //            ESP_LOGW(TAG, "Slave doesn't have anything to say %d %d", temp, s_tx_frames);
 
         }
 
-        struct wifi_buf buf;
-        BaseType_t ret = xQueueReceive(s_tx_queue, &buf, pdMS_TO_TICKS(10));
-        if (ret == pdTRUE) {
-
-            ESP_LOGD(TAG, "Got packet ready to send... sending!");
-            while (1) {
-                ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, &temp, SLAVE_RX_READY_FLAG_REG, 1, 0));
-                if (s_rx_frames != temp) {
-                    break;
-                }
-//                ESP_LOGI(TAG, "Slave NOT ready  ... %d %d", temp, s_rx_frames);
-                printf("X");
-//                vTaskDelay(pdMS_TO_TICKS(10));
+        if (tx_queue_stat == pdFALSE) {
+            tx_queue_stat = xQueueReceive(s_tx_queue, &buf, pdMS_TO_TICKS(10));
+        }
+        if (tx_queue_stat == pdTRUE) {
+            if (s_rx_frames != s_regs.rx_count) {
+                s_rx_frames++;
+                ESP_ERROR_CHECK(essl_spi_wrdma(spi, buf.buffer, buf.len, -1, 0));
+                free(buf.buffer);
+                tx_queue_stat = pdFALSE;
             }
-            s_rx_frames++;
-            ESP_LOGD(TAG, "Slave is ready %d %d!!", temp, s_rx_frames);
-            ESP_ERROR_CHECK(essl_spi_wrdma(spi, buf.buffer, buf.len, -1, 0));
-            free(buf.buffer);
-
         }
     }
 }

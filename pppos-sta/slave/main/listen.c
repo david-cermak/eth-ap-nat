@@ -23,17 +23,28 @@
 #define DMA_CHAN   SPI_DMA_CH_AUTO
 
 #define SLAVE_HOST SPI2_HOST
-#define SLAVE_READY_FLAG_REG            0
-#define SLAVE_READY_FLAG                0xEE
-//Value in these 4 registers (Byte 4, 5, 6, 7) indicates the MAX Slave TX buffer length
-#define SLAVE_MAX_TX_BUF_LEN_REG        4
-//Value in these 4 registers indicates the MAX Slave RX buffer length
-#define SLAVE_MAX_RX_BUF_LEN_REG        8
-//Value in these 4 registers indicates size of the TX buffer that Slave has loaded to the DMA
-#define SLAVE_TX_READY_BUF_SIZE_REG     12
 
-#define SLAVE_RX_READY_FLAG_REG      20
-#define SLAVE_TX_READY_FLAG_REG      21
+struct spihd_regs {
+    uint16_t tx_size;
+    uint8_t magic;
+    uint8_t tx_count;
+    uint8_t rx_count;
+    uint8_t checksum;
+} __attribute__((packed));
+
+static struct spihd_regs s_regs = { .tx_size = -1 };
+
+//#define SLAVE_READY_FLAG_REG            0
+//#define SLAVE_READY_FLAG                0xEE
+////Value in these 4 registers (Byte 4, 5, 6, 7) indicates the MAX Slave TX buffer length
+//#define SLAVE_MAX_TX_BUF_LEN_REG        4
+////Value in these 4 registers indicates the MAX Slave RX buffer length
+//#define SLAVE_MAX_RX_BUF_LEN_REG        8
+////Value in these 4 registers indicates size of the TX buffer that Slave has loaded to the DMA
+//#define SLAVE_TX_READY_BUF_SIZE_REG     12
+//
+//#define SLAVE_RX_READY_FLAG_REG      20
+//#define SLAVE_TX_READY_FLAG_REG      21
 
 
 static const char *TAG = "ppp_slave";
@@ -211,7 +222,17 @@ static void spi_sender(void *arg)
     }
 }
 
-void spi_receiver(void *arg)
+static void set_regs(void)
+{
+    uint8_t checksum = 0;
+    s_regs.checksum = 0;
+    for (int i=0; i< sizeof(s_regs); ++i)
+        checksum += ((uint8_t*)&s_regs)[i];
+    s_regs.checksum = checksum;
+    spi_slave_hd_write_buffer(SLAVE_HOST, 0, (uint8_t *)&s_regs, sizeof(s_regs));
+}
+
+static void spi_receiver(void *arg)
 {
     spi_slave_hd_data_t *ret_trans;
     uint32_t recv_buf_size = *(uint32_t *)arg;
@@ -226,8 +247,10 @@ void spi_receiver(void *arg)
     slave_trans.data = recv_buf;
     slave_trans.len = recv_buf_size;
     ESP_ERROR_CHECK(spi_slave_hd_queue_trans(SLAVE_HOST, SPI_SLAVE_CHAN_RX, &slave_trans, portMAX_DELAY));
-    s_rx_frames = 1;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_RX_READY_FLAG_REG, (uint8_t *)&s_rx_frames, 1);
+    s_regs.rx_count = 1;
+    set_regs();
+//    s_rx_frames = 1;
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_RX_READY_FLAG_REG, (uint8_t *)&s_rx_frames, 1);
 
     while (1) {
         ESP_ERROR_CHECK(spi_slave_hd_get_trans_res(SLAVE_HOST, SPI_SLAVE_CHAN_RX, &ret_trans, portMAX_DELAY));
@@ -250,17 +273,23 @@ void spi_receiver(void *arg)
 static bool cb_set_tx_ready_buf_size(void *arg, spi_slave_hd_event_t *event, BaseType_t *awoken)
 {
     uint32_t s_tx_ready_buf_size = event->trans->len;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_BUF_SIZE_REG, (uint8_t *)&s_tx_ready_buf_size, 4);
-    s_tx_frames++;
+    s_regs.tx_count++;
+    s_regs.tx_size = s_tx_ready_buf_size;
+    set_regs();
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_BUF_SIZE_REG, (uint8_t *)&s_tx_ready_buf_size, 4);
+//    s_tx_frames++;
 //                ESP_LOGW(TAG, "s_tx_frames=%d\n", (int)s_tx_frames);
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_FLAG_REG, (uint8_t *)&s_tx_frames, 1);
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_FLAG_REG, (uint8_t *)&s_tx_frames, 1);
 
     return true;
 }
 static bool cb_set_rx_ready_buf_num(void *arg, spi_slave_hd_event_t *event, BaseType_t *awoken)
 {
-    s_rx_frames++;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_RX_READY_FLAG_REG, (uint8_t *)&s_rx_frames, 1);
+//    s_rx_frames++;
+//
+    s_regs.rx_count++;
+    set_regs();
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_RX_READY_FLAG_REG, (uint8_t *)&s_rx_frames, 1);
     return true;
 }
 
@@ -295,16 +324,20 @@ static void init_slave_hd(void)
     uint8_t init_value[SOC_SPI_MAXIMUM_BUFFER_SIZE] = {0x0};
     spi_slave_hd_write_buffer(SLAVE_HOST, 0, init_value, SOC_SPI_MAXIMUM_BUFFER_SIZE);
     static uint32_t send_buf_size = 1600;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_MAX_TX_BUF_LEN_REG, (uint8_t *)&send_buf_size, sizeof(send_buf_size));
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_MAX_TX_BUF_LEN_REG, (uint8_t *)&send_buf_size, sizeof(send_buf_size));
     static uint32_t recv_buf_size = 1600;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_MAX_RX_BUF_LEN_REG, (uint8_t *)&recv_buf_size, sizeof(recv_buf_size));
-    uint32_t slave_ready_flag = SLAVE_READY_FLAG;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_READY_FLAG_REG, (uint8_t *)&slave_ready_flag, sizeof(slave_ready_flag));
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_MAX_RX_BUF_LEN_REG, (uint8_t *)&recv_buf_size, sizeof(recv_buf_size));
+//    uint32_t slave_ready_flag = SLAVE_READY_FLAG;
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_READY_FLAG_REG, (uint8_t *)&slave_ready_flag, sizeof(slave_ready_flag));
     xTaskCreate(spi_sender, "sendTask", 4096, &send_buf_size, 18, NULL);
     xTaskCreate(spi_receiver, "recvTask", 4096, &recv_buf_size, 18, NULL);
+    set_regs();
     vTaskDelay(pdMS_TO_TICKS(2000));
-    slave_ready_flag = 0;
-    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_READY_FLAG_REG, (uint8_t *)&slave_ready_flag, sizeof(slave_ready_flag));
+    s_regs.magic = 0x5A;
+    set_regs();
+
+//    slave_ready_flag = 0;
+//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_READY_FLAG_REG, (uint8_t *)&slave_ready_flag, sizeof(slave_ready_flag));
 
 }
 #endif // CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
