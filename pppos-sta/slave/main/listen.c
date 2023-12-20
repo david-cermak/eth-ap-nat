@@ -167,13 +167,29 @@ static void my_post_trans_cb(spi_slave_transaction_t *trans)
 }
 
 #define TRANSFER_SIZE (MAX_PAYLOAD + 4)
+#define SHORT_PAYLOAD (48)
+#define CONTROL_SIZE (SHORT_PAYLOAD + 4)
+#define CONTROL_MASTER 0xA5
+#define CONTROL_MASTER_WITH_DATA 0xA6
+#define CONTROL_SLAVE 0x5A
+#define CONTROL_SLAVE_WITH_DATA 0x5B
+#define DATA_MASTER 0xAF
+#define DATA_SLAVE 0xFA
+#define MAX(a,b) (((a)>(b))?(a):(b))
+
 struct header {
-    uint16_t size;
+    union {
+        uint16_t size;
+        struct {
+            uint8_t short_size;
+            uint8_t long_size;
+        } __attribute__((packed));
+    };
     uint8_t magic;
     uint8_t checksum;
 } __attribute__((packed));
 
-static void ppp_task(void *args)
+_Noreturn static void ppp_task(void *args)
 {
     spi_slave_transaction_t t;
     memset(&t, 0, sizeof(t));
@@ -184,46 +200,104 @@ static void ppp_task(void *args)
 
     while (1) {
         struct wifi_buf buf = { .len = 0 };
-        struct header head = { .magic = 0x5A, .size = 0, .checksum = 0};
+        struct header *head = (void *)out_buf;
+        bool need_data_frame = false;
+        size_t out_long_payload = 0;
+        head->magic = CONTROL_SLAVE_WITH_DATA;
+        head->size = 0;
+        head->checksum = 0;
         BaseType_t tx_queue_stat = xQueueReceive(s_tx_queue, &buf, 0);
         if (tx_queue_stat == pdTRUE && buf.buffer) {
-            head.size = buf.len;
+            if (buf.len > SHORT_PAYLOAD) {
+                head->magic = CONTROL_SLAVE;
+                head->size = buf.len;
+                out_long_payload = buf.len;
+                need_data_frame = true;
+//                printf("need_data_frame %d\n", buf.len);
+            } else {
+                head->magic = CONTROL_SLAVE_WITH_DATA;
+                head->long_size = 0;
+                head->short_size = buf.len;
+                memcpy(out_buf + sizeof(struct header), buf.buffer, buf.len);
+                free(buf.buffer);
+            }
         }
-        t.length = TRANSFER_SIZE * 8;
+        memset(&t, 0, sizeof(t));
+        t.length = CONTROL_SIZE * 8;
         t.tx_buffer = out_buf;
         t.rx_buffer = in_buf;
         for (int i=0; i<sizeof(struct header)-1; ++i)
-            head.checksum += ((uint8_t*)&head)[i];
-        memcpy(out_buf, &head, sizeof(struct header));
-        if (head.size > 0) {
-            memcpy(out_buf + sizeof(struct header), buf.buffer, head.size);
-//            printf("O:%d|\n", head.size);
-            free(buf.buffer);
-        } else {
-//            printf("*");
-        };
+            head->checksum += out_buf[i];
         esp_err_t ret = spi_slave_transmit(SLAVE_HOST, &t, portMAX_DELAY);
-
-        if (ret == ESP_OK) {
-            struct header *head = (struct header*)in_buf;
-            uint8_t checksum = 0;
-            for (int i=0; i<sizeof(struct header)-1; ++i)
-                checksum += in_buf[i];
-            if (checksum != head->checksum) {
-                ESP_LOGE(TAG, "Wrong checksum");
-                continue;
-            }
-            if (head->magic != 0xA5) {
-                ESP_LOGE(TAG, "Wrong magic");
-                continue;
-            }
-            if (head->size > 0) {
-//                printf("I:%d|\n", head->size);
-                esp_netif_receive(s_netif, in_buf + sizeof(struct header), head->size, NULL);
-            } else {
-//                printf(".");
-            }
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "spi_device_transmit failed");
+            continue;
         }
+        head = (void *)in_buf;
+        uint8_t checksum = 0;
+        for (int i=0; i<sizeof(struct header)-1; ++i)
+            checksum += in_buf[i];
+        if (checksum != head->checksum) {
+            ESP_LOGE(TAG, "Wrong checksum");
+            continue;
+        }
+//        printf("MAGIC: %x\n", head->magic);
+
+        if (head->magic != CONTROL_MASTER && head->magic != CONTROL_MASTER_WITH_DATA) {
+            ESP_LOGE(TAG, "Wrong magic");
+            continue;
+        }
+        if (head->magic == CONTROL_MASTER_WITH_DATA && head->short_size > 0) {
+            esp_netif_receive(s_netif, in_buf + sizeof(struct header), head->short_size, NULL);
+        }
+        size_t in_long_payload = 0;
+        if (head->magic == CONTROL_MASTER) {
+            need_data_frame = true;
+            in_long_payload = head->size;
+        }
+        if (!need_data_frame) {
+            continue;
+        }
+        // now, we need data frame
+//        printf("performing data frame %d\n", out_long_payload);
+        head = (void *)out_buf;
+        head->magic = DATA_SLAVE;
+        head->size = out_long_payload;
+        head->checksum = 0;
+        for (int i=0; i<sizeof(struct header)-1; ++i)
+            head->checksum += out_buf[i];
+        if (head->size > 0) {
+            memcpy(out_buf + sizeof(struct header), buf.buffer, buf.len);
+            free(buf.buffer);
+        }
+
+        memset(&t, 0, sizeof(t));
+        t.length = (MAX(in_long_payload, out_long_payload)+ sizeof(struct header))*8;
+        t.tx_buffer = out_buf;
+        t.rx_buffer = in_buf;
+        ret = spi_slave_transmit(SLAVE_HOST, &t, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "spi_device_transmit failed");
+            continue;
+        }
+        head = (void *)in_buf;
+        checksum = 0;
+        for (int i=0; i<sizeof(struct header)-1; ++i)
+            checksum += in_buf[i];
+        if (checksum != head->checksum) {
+            ESP_LOGE(TAG, "Wrong checksum");
+            continue;
+        }
+        if (head->magic != DATA_MASTER) {
+            ESP_LOGE(TAG, "Wrong magic");
+            continue;
+        }
+//        printf("got size %d\n", head->size);
+        if (head->size > 0) {
+//            ESP_LOG_BUFFER_HEXDUMP(TAG, in_buf + sizeof(struct header), head->size, ESP_LOG_INFO);
+            esp_netif_receive(s_netif, in_buf + sizeof(struct header), head->size, NULL);
+        }
+
     }
 }
 
