@@ -15,12 +15,18 @@
 #include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "esp_serial_slave_link/essl_spi.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+
 #define GPIO_MOSI    11
 #define GPIO_MISO    13
 #define GPIO_SCLK    12
 #define GPIO_CS      10
 #define MASTER_HOST SPI2_HOST
 #define DMA_CHAN     SPI_DMA_CH_AUTO
+#define GPIO_HANDSHAKE      2
+#define MAX_PAYLOAD 1600
+
 #define SLAVE_READY_FLAG_REG            0
 #define SLAVE_READY_FLAG                0xEE
 //Value in these 4 registers (Byte 4, 5, 6, 7) indicates the MAX Slave TX buffer length
@@ -38,10 +44,7 @@
 //#define SLAVE_TX_READY_FLAG_REG      21
 
 #define TX_SIZE_MIN  40
-
 static     spi_device_handle_t spi;
-static uint8_t s_tx_frames = 0;
-static uint8_t s_rx_frames = 0;
 
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_USB
 #include "tinyusb.h"
@@ -64,7 +67,9 @@ struct wifi_buf {
     void *eb;
 };
 static esp_netif_t *s_netif = NULL;
-QueueHandle_t s_tx_queue;
+static QueueHandle_t s_tx_queue;
+static QueueHandle_t rdySem;
+
 
 
 static const char *TAG = "example_connect_ppp";
@@ -87,13 +92,30 @@ static esp_err_t transmit(void *h, void *buffer, size_t len)
 //    ESP_LOGE(TAG, "len=%d\n", len);
 
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
-    struct wifi_buf buf = { .buffer = malloc(len), .len = len};
-    memcpy(buf.buffer, buffer, len);
+    struct wifi_buf buf = { };
 
-    BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(10));
-    if (ret != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to queue packet to slave!");
-    }
+    uint8_t *current_buffer = buffer;
+    size_t remaining = len;
+    do {
+        size_t batch = remaining > MAX_PAYLOAD ? MAX_PAYLOAD : remaining;
+        buf.buffer = malloc(batch);
+        buf.len = batch;
+        remaining -= batch;
+        memcpy(buf.buffer, current_buffer, batch);
+        current_buffer+= batch;
+        BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(10));
+        if (ret != pdTRUE) {
+            ESP_LOGE(TAG, "Failed to queue packet to slave!");
+        }
+    } while (remaining > 0);
+//
+//   buf.buffer = heap_caps_calloc(1, len, MALLOC_CAP_DMA);
+//
+//
+//    BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(10));
+//    if (ret != pdTRUE) {
+//        ESP_LOGE(TAG, "Failed to queue packet to slave!");
+//    }
     return ESP_OK;
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_USB
     tinyusb_cdcacm_write_queue(s_itf, buffer, len);
@@ -228,36 +250,36 @@ static void ppp_task(void *args)
 }
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
 
-struct spihd_regs {
-    uint16_t tx_size;
+struct header {
+    uint16_t size;
     uint8_t magic;
-    uint8_t tx_count;
-    uint8_t rx_count;
     uint8_t checksum;
 } __attribute__((packed));
 
-static struct spihd_regs s_regs = {  };
+//static struct spihd_regs s_regs = {  };
 
-static bool get_regs(void)
+static void IRAM_ATTR gpio_handshake_isr_handler(void* arg)
 {
-    esp_err_t ret = essl_spi_rdbuf(spi, (uint8_t *)&s_regs, 0,  sizeof(s_regs), 0);
-    if (ret != ESP_OK) {
-        return false;
+    //Sometimes due to interference or ringing or something, we get two irqs after eachother. This is solved by
+    //looking at the time between interrupts and refusing any interrupt too close to another one.
+    static uint32_t lasthandshaketime_us;
+    uint32_t currtime_us = esp_timer_get_time();
+    uint32_t diff = currtime_us - lasthandshaketime_us;
+    if (diff < 100) {
+        return; //ignore everything <1ms after an earlier irq
     }
-    uint8_t checksum_orig = s_regs.checksum;
-    uint8_t checksum = 0;
-    s_regs.checksum = 0;
-    for (int i=0; i< sizeof(s_regs); ++i)
-        checksum += ((uint8_t*)&s_regs)[i];
-    if (checksum != checksum_orig) {
-        ESP_LOGE(TAG, "Wrong checksum!");
-        return false;
+    lasthandshaketime_us = currtime_us;
+
+    //Give the semaphore.
+    BaseType_t mustYield = false;
+    xSemaphoreGiveFromISR(rdySem, &mustYield);
+    if (mustYield) {
+        portYIELD_FROM_ISR();
     }
-    return true;
 }
 
 
-static void init_master_hd(spi_device_handle_t* out_spi)
+static void init_master(spi_device_handle_t* out_spi)
 {
     //init bus
     spi_bus_config_t bus_cfg = {};
@@ -272,91 +294,128 @@ static void init_master_hd(spi_device_handle_t* out_spi)
 
     ESP_ERROR_CHECK(spi_bus_initialize(MASTER_HOST, &bus_cfg, DMA_CHAN));
 
-    //add device
+//    //add device
+//    spi_device_interface_config_t devcfg = {
+//            .command_bits = 0,
+//            .address_bits = 0,
+//            .dummy_bits = 0,
+//            .clock_speed_hz = 5000000,
+//            .duty_cycle_pos = 128,      //50% duty cycle
+//            .mode = 0,
+//            .spics_io_num = GPIO_CS,
+//            .cs_ena_posttrans = 3,      //Keep the CS low 3 cycles after transaction, to stop slave from missing the last bit when CS has less propagation delay than CLK
+//            .queue_size = 3
+//    };
     spi_device_interface_config_t dev_cfg = {};
-    dev_cfg.clock_speed_hz = 40*1000*1000;
+    dev_cfg.clock_speed_hz = 10*1000*1000;
     dev_cfg.mode = 0;
     dev_cfg.spics_io_num = GPIO_CS;
     dev_cfg.cs_ena_pretrans = 0;
     dev_cfg.cs_ena_posttrans = 0;
-    dev_cfg.command_bits = 8;
-    dev_cfg.address_bits = 8;
-    dev_cfg.dummy_bits = 8;
-    dev_cfg.queue_size = 16;
-    dev_cfg.flags = SPI_DEVICE_HALFDUPLEX;
-    dev_cfg.duty_cycle_pos = 0;
+//    dev_cfg.command_bits = 8;
+//    dev_cfg.address_bits = 8;
+//    dev_cfg.dummy_bits = 8;
+//    dev_cfg.queue_size = 16;
+//    dev_cfg.flags = SPI_DEVICE_HALFDUPLEX;
+    dev_cfg.duty_cycle_pos = 128;
     dev_cfg.input_delay_ns = 0;
     dev_cfg.pre_cb = NULL;
     dev_cfg.post_cb = NULL;
+    dev_cfg.cs_ena_posttrans = 3;
+    dev_cfg.queue_size = 3;
+
     ESP_ERROR_CHECK(spi_bus_add_device(MASTER_HOST, &dev_cfg, out_spi));
 
-    s_tx_queue = xQueueCreate(16, sizeof(struct wifi_buf));
+    //GPIO config for the handshake line.
+    gpio_config_t io_conf = {
+            .intr_type = GPIO_INTR_POSEDGE,
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = 1,
+            .pin_bit_mask = BIT64(GPIO_HANDSHAKE),
+    };
+    //Set up handshake line interrupt.
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_set_intr_type(GPIO_HANDSHAKE, GPIO_INTR_POSEDGE);
+    gpio_isr_handler_add(GPIO_HANDSHAKE, gpio_handshake_isr_handler, NULL);
 
-    while (1) {
-        if (!get_regs()) {
-            printf("x");
-        }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-        if (s_regs.magic == 0)
-            break;
-    }
 
-    uint32_t slave_max_buf_size = 1600;
+    s_tx_queue = xQueueCreate(16*4, sizeof(struct wifi_buf));
+    //Create the semaphore.
+    rdySem = xSemaphoreCreateBinary();
+
+    //Assume the slave is ready for the first transmission: if the slave started up before us, we will not detect
+    //positive edge on the handshake line.
+    xSemaphoreGive(rdySem);
+
+//    while (1) {
+//        if (!get_regs()) {
+//            printf("x");
+//        }
+//        vTaskDelay(100 / portTICK_PERIOD_MS);
+//        if (s_regs.magic == 0)
+//            break;
+//    }
+
+//    uint32_t slave_max_buf_size = 1600;
 //    ESP_ERROR_CHECK(essl_spi_rdbuf(spi, (uint8_t *)&slave_max_buf_size, SLAVE_MAX_TX_BUF_LEN_REG, 4, 0));
 //    printf("Slave MAX TX Buffer Size:       %"PRIu32"\n", slave_max_buf_size);
 //    ESP_ERROR_CHECK(essl_spi_rdbuf(spi, (uint8_t *)&slave_max_buf_size, SLAVE_MAX_RX_BUF_LEN_REG, 4, 0));
 //    printf("Slave MAX Rx Buffer Size:       %"PRIu32"\n", slave_max_buf_size);
-    uint8_t *send_buf = heap_caps_calloc(1, slave_max_buf_size, MALLOC_CAP_DMA);
-    if (!send_buf) {
-        ESP_LOGE(TAG, "No enough memory!");
-        abort();
-    }
+//    uint8_t *send_buf = heap_caps_calloc(1, slave_max_buf_size, MALLOC_CAP_DMA);
+//    if (!send_buf) {
+//        ESP_LOGE(TAG, "No enough memory!");
+//        abort();
+//    }
 
 }
 
+#define TRANSFER_SIZE (MAX_PAYLOAD + 4)
+
 static void ppp_task(void *args)
 {
-    uint8_t *recv_buf = heap_caps_calloc(1, 1600, MALLOC_CAP_DMA);
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
 
-    BaseType_t tx_queue_stat = pdFALSE;
-    struct wifi_buf buf;
+    WORD_ALIGNED_ATTR uint8_t out_buf[TRANSFER_SIZE] = {};
+    WORD_ALIGNED_ATTR uint8_t in_buf[TRANSFER_SIZE] = {};
+
     while (1) {
-
-        while (!get_regs() || s_regs.magic != 0x5A)
-        {
-            ESP_LOGW(TAG, "failed to get regs!");
-            vTaskDelay(pdMS_TO_TICKS(100));
+        struct wifi_buf buf = { .len = 0 };
+        struct header head = { .magic = 0xA5, .size = 0, .checksum = 0};
+        BaseType_t tx_queue_stat = xQueueReceive(s_tx_queue, &buf, 0);
+        if (tx_queue_stat == pdTRUE && buf.buffer) {
+            head.size = buf.len;
         }
-//        ESP_ERROR_CHECK(essl_spi_rdbuf_polling(spi, &temp, SLAVE_TX_READY_FLAG_REG, 1, 0));
-        if (s_tx_frames != s_regs.tx_count) {
-//            printf("|%d|", temp);
-//            ESP_LOGW(TAG, "Slave has something %d %d", temp, s_tx_frames);
-//            uint32_t size_to_read = 0;
-//            size_to_read = get_slave_tx_buf_size(spi);
-//            if (size_to_read > 0) {
-                s_tx_frames++;
-                ESP_ERROR_CHECK(essl_spi_rddma(spi, recv_buf, s_regs.tx_size, -1, 0));
-//                ESP_LOG_BUFFER_HEXDUMP(TAG, recv_buf, size_to_read, ESP_LOG_WARN);
-//                ESP_LOGE(TAG, "RECEIVING......len=%d", (int)size_to_read);
-//                printf("I%d|\n", (int)size_to_read);
-                esp_netif_receive(s_netif, recv_buf, s_regs.tx_size, NULL);
-//            }
-
-        } else {
-//            printf(".");
-//            ESP_LOGW(TAG, "Slave doesn't have anything to say %d %d", temp, s_tx_frames);
-
+        t.length = TRANSFER_SIZE * 8;
+        t.tx_buffer = out_buf;
+        t.rx_buffer = in_buf;
+        for (int i=0; i<sizeof(struct header)-1; ++i)
+            head.checksum += ((uint8_t*)&head)[i];
+        memcpy(out_buf, &head, sizeof(struct header));
+        if (head.size > 0) {
+            memcpy(out_buf + sizeof(struct header), buf.buffer, head.size);
+//            printf("O:%d|\n", head.size);
+            free(buf.buffer);
         }
-
-        if (tx_queue_stat == pdFALSE) {
-            tx_queue_stat = xQueueReceive(s_tx_queue, &buf, pdMS_TO_TICKS(10));
-        }
-        if (tx_queue_stat == pdTRUE) {
-            if (s_rx_frames != s_regs.rx_count) {
-                s_rx_frames++;
-                ESP_ERROR_CHECK(essl_spi_wrdma(spi, buf.buffer, buf.len, -1, 0));
-                free(buf.buffer);
-                tx_queue_stat = pdFALSE;
+        xSemaphoreTake(rdySem, portMAX_DELAY); //Wait until slave is ready
+        esp_err_t ret = spi_device_transmit(spi, &t);
+        if (ret == ESP_OK) {
+            struct header *head = (struct header*)in_buf;
+            uint8_t checksum = 0;
+            for (int i=0; i<sizeof(struct header)-1; ++i)
+                checksum += in_buf[i];
+            if (checksum != head->checksum) {
+                ESP_LOGE(TAG, "Wrong checksum");
+                continue;
+            }
+            if (head->magic != 0x5A) {
+                ESP_LOGE(TAG, "Wrong magic");
+                continue;
+            }
+            if (head->size > 0) {
+//                printf("I:%d|\n", head->size);
+                esp_netif_receive(s_netif, in_buf + sizeof(struct header), head->size, NULL);
             }
         }
     }
@@ -410,7 +469,7 @@ esp_err_t example_ppp_connect(void)
     s_netif = esp_netif_new(&netif_ppp_config);
     assert(s_netif);
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
-    init_master_hd(&spi);
+    init_master(&spi);
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, esp_netif_action_connected, s_netif);
     esp_netif_ppp_config_t netif_params;
     ESP_ERROR_CHECK(esp_netif_ppp_get_params(s_netif, &netif_params));
@@ -420,7 +479,7 @@ esp_err_t example_ppp_connect(void)
 
     esp_netif_action_start(s_netif, 0, 0, 0);
     esp_netif_action_connected(s_netif, 0, 0, 0);
-    if (xTaskCreate(ppp_task, "ppp connect", 4096, NULL, 18, NULL) != pdTRUE) {
+    if (xTaskCreate(ppp_task, "ppp connect", 2*4096, NULL, 18, NULL) != pdTRUE) {
         ESP_LOGE(TAG, "Failed to create a ppp connection task");
         return ESP_FAIL;
     }

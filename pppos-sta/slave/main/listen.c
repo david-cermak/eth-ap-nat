@@ -13,7 +13,9 @@
 #include "driver/uart.h"
 #include "lwip/netif.h"
 #include "lwip/lwip_napt.h"
-#include "driver/spi_slave_hd.h"
+//#include "driver/spi_slave_hd.h"
+#include "driver/spi_slave.h"
+#include "driver/gpio.h"
 
 #define QUEUE_SIZE 4
 #define GPIO_MOSI 11
@@ -21,40 +23,16 @@
 #define GPIO_SCLK 12
 #define GPIO_CS   10
 #define DMA_CHAN   SPI_DMA_CH_AUTO
+#define GPIO_HANDSHAKE      2
 
 #define SLAVE_HOST SPI2_HOST
-
-struct spihd_regs {
-    uint16_t tx_size;
-    uint8_t magic;
-    uint8_t tx_count;
-    uint8_t rx_count;
-    uint8_t checksum;
-} __attribute__((packed));
-
-static struct spihd_regs s_regs = { .tx_size = -1 };
-
-//#define SLAVE_READY_FLAG_REG            0
-//#define SLAVE_READY_FLAG                0xEE
-////Value in these 4 registers (Byte 4, 5, 6, 7) indicates the MAX Slave TX buffer length
-//#define SLAVE_MAX_TX_BUF_LEN_REG        4
-////Value in these 4 registers indicates the MAX Slave RX buffer length
-//#define SLAVE_MAX_RX_BUF_LEN_REG        8
-////Value in these 4 registers indicates size of the TX buffer that Slave has loaded to the DMA
-//#define SLAVE_TX_READY_BUF_SIZE_REG     12
-//
-//#define SLAVE_RX_READY_FLAG_REG      20
-//#define SLAVE_TX_READY_FLAG_REG      21
-
-
+#define MAX_PAYLOAD 1600
 static const char *TAG = "ppp_slave";
 
 static const int CONNECT_BIT = BIT0;
 static EventGroupHandle_t event_group = NULL;
 QueueHandle_t s_tx_queue;
 esp_netif_t *s_netif;
-static uint8_t s_tx_frames = 0;
-static uint8_t s_rx_frames = 0;
 
 struct wifi_buf {
     void *buffer;
@@ -65,17 +43,32 @@ struct wifi_buf {
 
 static esp_err_t transmit(void *h, void *buffer, size_t len)
 {
-    static uint8_t cnt = 0;
+//    static uint8_t cnt = 0;
 //    ESP_LOG_BUFFER_HEXDUMP("ppp_connect_tx", buffer, len, ESP_LOG_ERROR);
 //    ESP_LOGE(TAG, "len=%d\n", len);
 //    printf("O%d|\n", len);
 
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
-    struct wifi_buf buf = { .buffer = malloc(len), .len = len, .count =cnt++};
-    memcpy(buf.buffer, buffer, len);
+    struct wifi_buf buf = { };
 
-    BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(100));
-    return ret == pdTRUE ? ESP_OK : ESP_FAIL;
+    size_t remaining = len;
+    do {
+        size_t batch = remaining > MAX_PAYLOAD ? MAX_PAYLOAD : remaining;
+        buf.buffer = malloc(batch);
+        buf.len = batch;
+        remaining -= batch;
+        memcpy(buf.buffer, buffer, batch);
+        BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(10));
+        if (ret != pdTRUE) {
+            ESP_LOGE(TAG, "Failed to queue packet to slave!");
+        }
+    } while (remaining > 0);
+
+//    struct wifi_buf buf = { .buffer = malloc(len), .len = len, .count =cnt++};
+//    memcpy(buf.buffer, buffer, len);
+//
+//    BaseType_t ret = xQueueSend(s_tx_queue, &buf, pdMS_TO_TICKS(100));
+//    return ret == pdTRUE ? ESP_OK : ESP_FAIL;
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_UART
     uart_write_bytes(UART_NUM_1, buffer, len);
 #endif
@@ -159,141 +152,82 @@ static void on_ip_event(void *arg, esp_event_base_t event_base,
 }
 
 #if CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
-static void spi_sender(void *arg)
+//Called after a transaction is queued and ready for pickup by master. We use this to set the handshake line high.
+static void my_post_setup_cb(spi_slave_transaction_t *trans)
 {
-    esp_err_t err = ESP_OK;
-    uint32_t send_buf_size = *(uint32_t *)arg;      //Tx buffer max size
-    uint8_t *send_buf;                              //TX buffer
-    spi_slave_hd_data_t slave_trans;                //Transaction descriptor
-    spi_slave_hd_data_t *ret_trans;                 //Pointer to the descriptor of return result
+    gpio_set_level(GPIO_HANDSHAKE, 1);
+//    ESP_EARLY_LOGE(TAG, "1");
+}
 
-    send_buf = heap_caps_calloc(1, send_buf_size, MALLOC_CAP_DMA);
-    if (!send_buf) {
-        ESP_LOGE(TAG, "No enough memory!");
-        abort();
-    }
+//Called after transaction is sent/received. We use this to set the handshake line low.
+static void my_post_trans_cb(spi_slave_transaction_t *trans)
+{
+    gpio_set_level(GPIO_HANDSHAKE, 0);
+//    ESP_EARLY_LOGE(TAG, "0");
+}
+
+#define TRANSFER_SIZE (MAX_PAYLOAD + 4)
+struct header {
+    uint16_t size;
+    uint8_t magic;
+    uint8_t checksum;
+} __attribute__((packed));
+
+static void ppp_task(void *args)
+{
+    spi_slave_transaction_t t;
+    memset(&t, 0, sizeof(t));
+
+    //Create the semaphore.
+    WORD_ALIGNED_ATTR uint8_t out_buf[TRANSFER_SIZE] = {};
+    WORD_ALIGNED_ATTR uint8_t in_buf[TRANSFER_SIZE] = {};
 
     while (1) {
-            /**
-             * Here we simply get some random data.
-             * In your own code, you could prepare some buffers, and create a FreeRTOS task to generate/get data, and give a
-             * Semaphore to unblock this `sender()` Task.
-             */
-            struct wifi_buf buf;
-            BaseType_t ret = xQueueReceive(s_tx_queue, &buf, pdMS_TO_TICKS(10));
-            if (ret == pdTRUE) {
-                ESP_LOGD(TAG, "Got packet size=%d, count=%d", buf.len, buf.count);
-                slave_trans.data = buf.buffer;
-                slave_trans.len = buf.len;
-                slave_trans.arg = (void*)((intptr_t)buf.count);
-                //Due to the `queue_sent_cnt` and `queue_recv_cnt` logic above, we are sure there is space to send data, this will return ESP_OK immediately
-                ESP_ERROR_CHECK(spi_slave_hd_queue_trans(SLAVE_HOST, SPI_SLAVE_CHAN_TX, &slave_trans, portMAX_DELAY));
-                // tell the master that we have something
-//                s_tx_frames++;
-//                ESP_LOGW(TAG, "s_tx_frames=%d\n", (int)s_tx_frames);
-//                spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_FLAG_REG, (uint8_t *)&s_tx_frames, 1);
+        struct wifi_buf buf = { .len = 0 };
+        struct header head = { .magic = 0x5A, .size = 0, .checksum = 0};
+        BaseType_t tx_queue_stat = xQueueReceive(s_tx_queue, &buf, 0);
+        if (tx_queue_stat == pdTRUE && buf.buffer) {
+            head.size = buf.len;
+        }
+        t.length = TRANSFER_SIZE * 8;
+        t.tx_buffer = out_buf;
+        t.rx_buffer = in_buf;
+        for (int i=0; i<sizeof(struct header)-1; ++i)
+            head.checksum += ((uint8_t*)&head)[i];
+        memcpy(out_buf, &head, sizeof(struct header));
+        if (head.size > 0) {
+            memcpy(out_buf + sizeof(struct header), buf.buffer, head.size);
+//            printf("O:%d|\n", head.size);
+            free(buf.buffer);
+        } else {
+//            printf("*");
+        };
+        esp_err_t ret = spi_slave_transmit(SLAVE_HOST, &t, portMAX_DELAY);
+
+        if (ret == ESP_OK) {
+            struct header *head = (struct header*)in_buf;
+            uint8_t checksum = 0;
+            for (int i=0; i<sizeof(struct header)-1; ++i)
+                checksum += in_buf[i];
+            if (checksum != head->checksum) {
+                ESP_LOGE(TAG, "Wrong checksum");
+                continue;
             }
-        //Recycle the transaction
-        while (1) {
-            /**
-             * Get the TX transaction result
-             *
-             * The ``ret_trans`` will exactly point to the transaction descriptor passed to the driver before (here ``slave_trans``).
-             * For TX, the ``ret_trans->trans_len`` is meaningless. But you do need this API to maintain the internal queue.
-             */
-            err = spi_slave_hd_get_trans_res(SLAVE_HOST, SPI_SLAVE_CHAN_TX, &ret_trans, pdMS_TO_TICKS(0));
-            if (err != ESP_OK) {
-                assert(err == ESP_ERR_TIMEOUT);
-//                vTaskDelay(pdMS_TO_TICKS(10));
-//                if (ret == pdTRUE) {
-//                    vTaskDelay(pdMS_TO_TICKS(10));
-//                    continue;
-//                }
-//                ESP_LOGW(TAG, "continue...?");
-                break; // CONTINUE?
+            if (head->magic != 0xA5) {
+                ESP_LOGE(TAG, "Wrong magic");
+                continue;
             }
-            if (ret_trans && ret_trans->arg) {
-                free(ret_trans->data);
-//                ESP_LOGE(TAG, "Completed Tx (total cnt=%d)", (int)(ret_trans->arg));
-                ret_trans->arg = NULL;
-                break;
+            if (head->size > 0) {
+//                printf("I:%d|\n", head->size);
+                esp_netif_receive(s_netif, in_buf + sizeof(struct header), head->size, NULL);
+            } else {
+//                printf(".");
             }
         }
     }
 }
 
-static void set_regs(void)
-{
-    uint8_t checksum = 0;
-    s_regs.checksum = 0;
-    for (int i=0; i< sizeof(s_regs); ++i)
-        checksum += ((uint8_t*)&s_regs)[i];
-    s_regs.checksum = checksum;
-    spi_slave_hd_write_buffer(SLAVE_HOST, 0, (uint8_t *)&s_regs, sizeof(s_regs));
-}
-
-static void spi_receiver(void *arg)
-{
-    spi_slave_hd_data_t *ret_trans;
-    uint32_t recv_buf_size = *(uint32_t *)arg;
-    uint8_t *recv_buf;
-    spi_slave_hd_data_t slave_trans;
-    recv_buf = heap_caps_calloc(1, recv_buf_size, MALLOC_CAP_DMA);
-    if (!recv_buf) {
-        ESP_LOGE(TAG, "No enough memory!");
-        abort();
-    }
-
-    slave_trans.data = recv_buf;
-    slave_trans.len = recv_buf_size;
-    ESP_ERROR_CHECK(spi_slave_hd_queue_trans(SLAVE_HOST, SPI_SLAVE_CHAN_RX, &slave_trans, portMAX_DELAY));
-    s_regs.rx_count = 1;
-    set_regs();
-//    s_rx_frames = 1;
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_RX_READY_FLAG_REG, (uint8_t *)&s_rx_frames, 1);
-
-    while (1) {
-        ESP_ERROR_CHECK(spi_slave_hd_get_trans_res(SLAVE_HOST, SPI_SLAVE_CHAN_RX, &ret_trans, portMAX_DELAY));
-        //Process the received data in your own code. Here we just print it out.
-//        ESP_LOG_BUFFER_HEXDUMP("ppp_uart_recv", ret_trans->data, ret_trans->trans_len, ESP_LOG_WARN);
-//        printf("I%d|\n", ret_trans->trans_len);
-        esp_netif_receive(s_netif, ret_trans->data, ret_trans->trans_len, NULL);
-//        ESP_LOGW(TAG, "received... %d", s_rx_frames);
-        /**
-         * Prepared data for new transaction
-         */
-        slave_trans.data = recv_buf;
-        slave_trans.len = recv_buf_size;
-        ESP_ERROR_CHECK(spi_slave_hd_queue_trans(SLAVE_HOST, SPI_SLAVE_CHAN_RX, &slave_trans, portMAX_DELAY));
-
-    }
-}
-
-
-static bool cb_set_tx_ready_buf_size(void *arg, spi_slave_hd_event_t *event, BaseType_t *awoken)
-{
-    uint32_t s_tx_ready_buf_size = event->trans->len;
-    s_regs.tx_count++;
-    s_regs.tx_size = s_tx_ready_buf_size;
-    set_regs();
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_BUF_SIZE_REG, (uint8_t *)&s_tx_ready_buf_size, 4);
-//    s_tx_frames++;
-//                ESP_LOGW(TAG, "s_tx_frames=%d\n", (int)s_tx_frames);
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_TX_READY_FLAG_REG, (uint8_t *)&s_tx_frames, 1);
-
-    return true;
-}
-static bool cb_set_rx_ready_buf_num(void *arg, spi_slave_hd_event_t *event, BaseType_t *awoken)
-{
-//    s_rx_frames++;
-//
-    s_regs.rx_count++;
-    set_regs();
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_RX_READY_FLAG_REG, (uint8_t *)&s_rx_frames, 1);
-    return true;
-}
-
-static void init_slave_hd(void)
+static void init_slave(void)
 {    spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = GPIO_MOSI;
     bus_cfg.miso_io_num = GPIO_MISO;
@@ -304,40 +238,35 @@ static void init_slave_hd(void)
     bus_cfg.flags = 0;
     bus_cfg.intr_flags = 0;
 
-    spi_slave_hd_slot_config_t slave_hd_cfg = {};
-    slave_hd_cfg.spics_io_num = GPIO_CS;
-    slave_hd_cfg.flags = 0;
-    slave_hd_cfg.mode = 0;
-    slave_hd_cfg.command_bits = 8;
-    slave_hd_cfg.address_bits = 8;
-    slave_hd_cfg.dummy_bits = 8;
-    slave_hd_cfg.queue_size = QUEUE_SIZE;
-    slave_hd_cfg.dma_chan = DMA_CHAN;
-    slave_hd_cfg.cb_config = (spi_slave_hd_callback_config_t) {
-            .cb_send_dma_ready = cb_set_tx_ready_buf_size,
-            .cb_recv_dma_ready = cb_set_rx_ready_buf_num,
+    //Configuration for the SPI slave interface
+    spi_slave_interface_config_t slvcfg = {
+            .mode = 0,
+            .spics_io_num = GPIO_CS,
+            .queue_size = 3,
+            .flags = 0,
+            .post_setup_cb = my_post_setup_cb,
+            .post_trans_cb = my_post_trans_cb
     };
 
-    ESP_ERROR_CHECK(spi_slave_hd_init(SLAVE_HOST, &bus_cfg, &slave_hd_cfg));
+    //Configuration for the handshake line
+    gpio_config_t io_conf = {
+            .intr_type = GPIO_INTR_DISABLE,
+            .mode = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = BIT64(GPIO_HANDSHAKE),
+    };
 
-    s_tx_queue = xQueueCreate(QUEUE_SIZE, sizeof(struct wifi_buf));
-    uint8_t init_value[SOC_SPI_MAXIMUM_BUFFER_SIZE] = {0x0};
-    spi_slave_hd_write_buffer(SLAVE_HOST, 0, init_value, SOC_SPI_MAXIMUM_BUFFER_SIZE);
-    static uint32_t send_buf_size = 1600;
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_MAX_TX_BUF_LEN_REG, (uint8_t *)&send_buf_size, sizeof(send_buf_size));
-    static uint32_t recv_buf_size = 1600;
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_MAX_RX_BUF_LEN_REG, (uint8_t *)&recv_buf_size, sizeof(recv_buf_size));
-//    uint32_t slave_ready_flag = SLAVE_READY_FLAG;
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_READY_FLAG_REG, (uint8_t *)&slave_ready_flag, sizeof(slave_ready_flag));
-    xTaskCreate(spi_sender, "sendTask", 4096, &send_buf_size, 18, NULL);
-    xTaskCreate(spi_receiver, "recvTask", 4096, &recv_buf_size, 18, NULL);
-    set_regs();
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    s_regs.magic = 0x5A;
-    set_regs();
+    //Configure handshake line as output
+    gpio_config(&io_conf);
+    //Enable pull-ups on SPI lines so we don't detect rogue pulses when no master is connected.
+    gpio_set_pull_mode(GPIO_MOSI, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_SCLK, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(GPIO_CS, GPIO_PULLUP_ONLY);
 
-//    slave_ready_flag = 0;
-//    spi_slave_hd_write_buffer(SLAVE_HOST, SLAVE_READY_FLAG_REG, (uint8_t *)&slave_ready_flag, sizeof(slave_ready_flag));
+    //Initialize SPI slave interface
+    esp_err_t ret = spi_slave_initialize(SLAVE_HOST, &bus_cfg, &slvcfg, SPI_DMA_CH_AUTO);
+    assert(ret == ESP_OK);
+
+    s_tx_queue = xQueueCreate(4*16, sizeof(struct wifi_buf));
 
 }
 #endif // CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
@@ -360,7 +289,11 @@ void station_ppp_listen()
         return;
     }
 #elif CONFIG_EXAMPLE_CONNECT_PPP_DEVICE_SPI
-    init_slave_hd();
+    init_slave();
+    if (xTaskCreate(ppp_task, "ppp connect", 2*4096, s_netif, 18, NULL) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create a ppp connection task");
+        return;
+    }
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, esp_netif_action_connected, s_netif);
     esp_netif_ppp_config_t netif_params;
     ESP_ERROR_CHECK(esp_netif_ppp_get_params(s_netif, &netif_params));
