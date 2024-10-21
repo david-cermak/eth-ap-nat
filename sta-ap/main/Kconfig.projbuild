@@ -1,0 +1,54 @@
+menu "Example Configuration"
+
+    menu "AP Configuration"
+        comment "AP Configuration"
+
+        config EXAMPLE_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "sta2ap"
+            help
+                Set the SSID of Wi-Fi ap interface.
+
+        config EXAMPLE_WIFI_PASSWORD
+            string "Wi-Fi Password"
+            default "12345678"
+            help
+                Set the password of Wi-Fi ap interface.
+
+        config EXAMPLE_WIFI_CHANNEL
+            int "WiFi channel"
+            range 1 13
+            default 1
+            help
+                Set the channel of Wi-Fi ap.
+
+        config EXAMPLE_MAX_STA_CONN
+            int "Maximum STA connections"
+            default 4
+            help
+                Maximum number of the station that allowed to connect to current Wi-Fi hotspot.
+    endmenu
+
+    menu "STA Configuration"
+        comment "STA Configuration"
+
+        config EXAMPLE_WIFI_STA_SSID
+            string "WiFi Station SSID"
+            default "myssid"
+            help
+                SSID for the example's sta to connect to.
+
+        config EXAMPLE_WIFI_STA_PASSWORD
+            string "WiFi Station Password"
+            default "mypassword"
+            help
+                WiFi station password for the example to use.
+
+        config EXAMPLE_MAXIMUM_STA_RETRY
+            int "Maximum retry"
+            default 5
+            help
+                Set the maximum retry value to prevent the station from continuously
+                attempting to reconnect to the Access Point (AP) when the AP doesn't exist.
+    endmenu
+endmenu
