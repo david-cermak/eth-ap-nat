@@ -22,11 +22,6 @@ menu "Example Configuration"
             help
                 Set the channel of Wi-Fi ap.
 
-        config EXAMPLE_MAX_STA_CONN
-            int "Maximum STA connections"
-            default 4
-            help
-                Maximum number of the station that allowed to connect to current Wi-Fi hotspot.
     endmenu
 
     menu "STA Configuration"
@@ -51,4 +46,14 @@ menu "Example Configuration"
                 Set the maximum retry value to prevent the station from continuously
                 attempting to reconnect to the Access Point (AP) when the AP doesn't exist.
     endmenu
+
+    config EXAMPLE_MODIFY_DHCP_MESSAGES
+        bool "Modify DHCP messages"
+        default y
+        help
+            This is needed if the client uses 61 option and the DHCP server applies strict rules
+            on assigning addresses.
+            Set this to 'n' if you don't need DHCP or you're using simplified DHCP workflow
+            without HW address options in DHCP messages.
+
 endmenu
