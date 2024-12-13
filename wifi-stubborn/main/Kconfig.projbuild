@@ -1,0 +1,26 @@
+menu "Example Configuration"
+
+    config EXAMPLE_FIRMWARE_UPGRADE_URL
+        string "firmware upgrade url endpoint"
+        default "https://192.168.0.3:8070/hello_world.bin"
+        help
+            URL of server which hosts the firmware
+            image.
+
+    menu "STA Configuration"
+        comment "STA Configuration"
+
+        config EXAMPLE_STA_SSID
+            string "WiFi Station SSID"
+            default "mystationssid"
+            help
+                SSID for the example's sta to connect to.
+
+        config EXAMPLE_STA_PASSWORD
+            string "WiFi Station Password"
+            default "mystationpassword"
+            help
+                WiFi station password for the example to use.
+    endmenu
+
+endmenu
